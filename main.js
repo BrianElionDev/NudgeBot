@@ -1,18 +1,17 @@
 import "dotenv/config";
 import { logger } from "./src/core/logger.js";
-import { startDemoSource } from "./src/sources/demo.js";
+import { StartWebsocket } from "./src/sources/discord.js";
 
-logger.info("NudgeBot (demo) starting...");
+logger.info("NudgeBot starting...");
 
-// Start demo source and keep process alive
-const stopDemo = startDemoSource(Number(process.env.DEMO_INTERVAL_MS || 8000));
+const stopWebsocket = StartWebsocket();
 
 let stopped = false;
 function stopAll(code = 0) {
   if (stopped) return;
   stopped = true;
   try {
-    stopDemo?.();
+    stopWebsocket?.();
   } catch {}
   process.exit(code);
 }
