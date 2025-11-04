@@ -1,13 +1,14 @@
 import WebSocket from "ws";
 import { pushNotification } from "../core/notifier.js";
 import { logger } from "../core/logger.js";
-import "dotenv/config";
+import "../core/config.js";
+import {
+  findChannelConfig,
+  initializeChannelConfigs,
+} from "../core/channelConfig.js";
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN || "";
-const WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
 const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
-const TARGET_CHANNELS_ID = ["1412863957554958519"];
-const TARGET_AUTHORS_USERNAME = ["ash_night_owl"];
 const CONTRACT_REGEX =
   /\b(?:0x[a-fA-F0-9]{40,64}|[A-HJ-NP-Za-km-z1-9]{32,64})\b/;
 
@@ -137,9 +138,14 @@ function connect() {
 }
 
 export async function handleMessageCreate(d) {
-  if (!TARGET_CHANNELS_ID.includes(d.channel_id)) return;
-  if (!TARGET_AUTHORS_USERNAME.includes(d.author.username)) return;
+  const channelConfig = await findChannelConfig(
+    d.channel_id,
+    d.author.username
+  );
+
+  if (!channelConfig) return;
   if (!checkIfContractIsInTheMessage(d.content)) return;
+
   const logEntry = {
     id: d.id,
     guild_id: d.guild_id || "DM",
@@ -161,15 +167,14 @@ export async function handleMessageCreate(d) {
   console.log("-------------------------------");
 
   try {
-    const title = `Discord • ${d.author.username} (#${d.channel_id})`;
-    const preview =
-      d.content.length > 220 ? `${d.content.slice(0, 217)}...` : d.content;
-    pushNotification(title, preview || "(no text)");
-    logger.info(`Discord notify ${d.author.username} ${d.id}`);
-
     const contractAddress = extractContractAddress(d.content);
     if (contractAddress) {
-      await sendToWebhook(d.author.username, contractAddress, d.content);
+      await sendToWebhook(
+        d.author.username,
+        contractAddress,
+        d.content,
+        channelConfig
+      );
     }
   } catch (err) {
     logger.error(`Failed to push notification: ${err?.stack || err}`);
@@ -194,8 +199,8 @@ function handleReconnection() {
   }
 }
 
-// Store the WebSocket instance
-export function StartWebsocket() {
+export async function StartWebsocket() {
+  await initializeChannelConfigs();
   ws = connect();
   return () => {
     try {
@@ -228,15 +233,22 @@ function extractContractAddress(content = "") {
   return match ? match[0] : null;
 }
 
-async function sendToWebhook(username, contractAddress, content) {
+async function sendToWebhook(username, contractAddress, content, channelConfig) {
+  if (!channelConfig.destinationEndpoint) {
+    logger.error(
+      `No destination endpoint configured for ${channelConfig.destinationServer}`
+    );
+    return;
+  }
+
   try {
-    const response = await fetch(WEBHOOK_URL, {
+    const response = await fetch(channelConfig.destinationEndpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        content: `**Username:** ${username}\n**Contract Address:** ${contractAddress}`,
+        content: `**Username:** ${username}\n**Channel Name:** ${channelConfig.channelName}\n**Contract Address:** ${contractAddress}`,
       }),
     });
 
@@ -246,7 +258,9 @@ async function sendToWebhook(username, contractAddress, content) {
       );
     }
 
-    logger.info(`Webhook forwarded: ${username} - ${contractAddress}`);
+    logger.info(
+      `Webhook forwarded to ${channelConfig.destinationServer}: ${username} - ${contractAddress}`
+    );
   } catch (err) {
     logger.error(`Failed to send webhook: ${err?.stack || err}`);
   }
