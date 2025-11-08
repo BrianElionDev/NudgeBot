@@ -6,6 +6,13 @@ import {
   findChannelConfig,
   initializeChannelConfigs,
 } from "../core/channelConfig.js";
+import { recordTokenEntry } from "../core/profitTracker.js";
+import { createClient } from "@supabase/supabase-js";
+
+const supabaseUrl = process.env.SUPABASE_URL || "";
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const supabase =
+  supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN || "";
 const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -25,6 +32,9 @@ function connect() {
   const ws = new WebSocket(GATEWAY_URL);
 
   ws.on("open", () => {
+    logger.logDiscord("websocket_connected", {
+      reconnectAttempts,
+    });
     console.log("Connected to Discord Gateway");
     reconnectAttempts = 0; // Reset reconnect attempts on successful connection
   });
@@ -64,6 +74,10 @@ function connect() {
             },
           };
           ws.send(JSON.stringify(resumePayload));
+          logger.logDiscord("session_resume_attempt", {
+            sessionId,
+            sequence,
+          });
           console.log("Attempting to resume session");
         } else {
           // Identify as new session
@@ -80,6 +94,7 @@ function connect() {
             },
           };
           ws.send(JSON.stringify(identifyPayload));
+          logger.logDiscord("session_identify_sent");
           console.log("Sent Identify payload");
         }
         break;
@@ -89,11 +104,16 @@ function connect() {
         break;
 
       case 7: // Reconnect
+        logger.logDiscord("server_reconnect_requested");
         console.log("Server requested reconnect");
         ws.close(4000); // Close with reconnect code
         break;
 
       case 9: // Invalid Session
+        logger.logDiscord("invalid_session", {
+          sessionId,
+          sequence,
+        });
         console.log("Invalid session, reconnecting...");
         sessionId = null;
         sequence = null;
@@ -103,9 +123,13 @@ function connect() {
       default:
         // Handle events
         if (t === "READY") {
+          logger.logDiscord("bot_ready", {
+            sessionId: d?.session_id,
+          });
           console.log("Bot is ready");
           sessionId = d?.session_id || sessionId;
         } else if (t === "RESUMED") {
+          logger.logDiscord("session_resumed");
           console.log("Session resumed successfully");
         } else if (t === "MESSAGE_CREATE") {
           handleMessageCreate(d);
@@ -115,6 +139,11 @@ function connect() {
   });
 
   ws.on("close", (code, reason) => {
+    logger.logDiscord("websocket_closed", {
+      code,
+      reason: reason.toString(),
+      reconnectAttempts,
+    });
     console.log(`Disconnected from Discord: ${code} - ${reason}`);
 
     // Clear heartbeat interval
@@ -131,6 +160,9 @@ function connect() {
   });
 
   ws.on("error", (error) => {
+    logger.logException(error, {
+      source: "discord_websocket",
+    });
     console.error("WebSocket error:", error);
   });
 
@@ -159,6 +191,16 @@ export async function handleMessageCreate(d) {
   };
 
   const link = `https://discord.com/channels/${d.guild_id}/${d.channel_id}/${d.id}`;
+
+  logger.logDiscord("message_received", {
+    messageId: d.id,
+    channelId: d.channel_id,
+    guildId: d.guild_id,
+    author: d.author.username,
+    timestamp: d.timestamp,
+    hasContract: checkIfContractIsInTheMessage(d.content),
+  });
+
   console.log("💬 New message:");
   console.log(`👤 Author: ${d.author.username}`);
   console.log(`📅 Date: ${d.timestamp}`);
@@ -169,15 +211,70 @@ export async function handleMessageCreate(d) {
   try {
     const contractAddress = extractContractAddress(d.content);
     if (contractAddress) {
+      // Record token entry for profit tracking
+      const messageLink = d.guild_id
+        ? `https://discord.com/channels/${d.guild_id}/${d.channel_id}/${d.id}`
+        : null;
+
+      // Get source channel ID from discord_source_channels table
+      let sourceChannelId = null;
+      if (supabase && d.channel_id) {
+        try {
+          const { data: sourceChannel } = await supabase
+            .from("discord_source_channels")
+            .select("id")
+            .eq("channel_id", d.channel_id)
+            .single();
+
+          if (sourceChannel) {
+            sourceChannelId = sourceChannel.id;
+          }
+        } catch (err) {
+          logger.logException(err, {
+            source: "discord_source_channel_lookup",
+            channelId: d.channel_id,
+          });
+          logger.warn(
+            `Could not find source channel for channel_id: ${d.channel_id}`,
+            { channelId: d.channel_id }
+          );
+        }
+      }
+
+      logger.logDiscord("token_detected", {
+        contractAddress,
+        caller: d.author.username,
+        channelId: d.channel_id,
+        messageId: d.id,
+      });
+
+      // Send to webhook first before running token search
       await sendToWebhook(
         d.author.username,
         contractAddress,
         d.content,
         channelConfig
       );
+
+      // Record token entry for profit tracking (runs token search)
+      await recordTokenEntry({
+        contractAddress,
+        caller: d.author.username,
+        sourceChannelId,
+        messageLink,
+        chain: "bsc", // Default to BSC, can be made configurable
+      });
     }
   } catch (err) {
-    logger.error(`Failed to push notification: ${err?.stack || err}`);
+    logger.logException(err, {
+      source: "handleMessageCreate",
+      messageId: d.id,
+      channelId: d.channel_id,
+    });
+    logger.error(`Failed to push notification: ${err?.stack || err}`, {
+      messageId: d.id,
+      channelId: d.channel_id,
+    });
   }
 }
 
@@ -233,7 +330,12 @@ function extractContractAddress(content = "") {
   return match ? match[0] : null;
 }
 
-async function sendToWebhook(username, contractAddress, content, channelConfig) {
+async function sendToWebhook(
+  username,
+  contractAddress,
+  content,
+  channelConfig
+) {
   if (!channelConfig.destinationEndpoint) {
     logger.error(
       `No destination endpoint configured for ${channelConfig.destinationServer}`

@@ -13,25 +13,11 @@ if (!supabaseUrl || !supabaseKey) {
 const supabase =
   supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
-const SOURCE_CHANNELS = {
-  "1374512585201684541": {
-    serverName: "OC",
-    channelName: "Oc-channel-1",
-  },
-  "1103867552213499934": {
-    serverName: "OC",
-    channelName: "Oc-channel-2",
-  },
-  "1412863957554958519": {
-    serverName: "OC",
-    channelName: "Oc-channel-testing",
-  },
-};
-
-const DESTINATION_SERVER_MAP = {
-  "oc-degen": process.env.DISCORD_WEBHOOK_OC_DEGEN || "",
-  "oc-nightfall": process.env.DISCORD_WEBHOOK_OC_NIGHTFALL || "",
-};
+let SOURCE_CHANNELS = {};
+let DESTINATION_SERVER_MAP = {};
+let CHANNEL_CONFIGS = [];
+let configsLoaded = false;
+let realtimeSubscriptions = [];
 
 function getDestinationEndpoint(destinationServer) {
   return DESTINATION_SERVER_MAP[destinationServer] || "";
@@ -63,14 +49,75 @@ export class ChannelConfig {
   }
 }
 
-let CHANNEL_CONFIGS = [];
-let configsLoaded = false;
-
-async function loadChannelConfigs() {
+async function loadSourceChannels() {
   if (!supabase) {
     logger.error(
-      "Supabase client not initialized. Cannot load channel configs."
+      "Supabase client not initialized. Cannot load source channels."
     );
+    return;
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("discord_source_channels")
+      .select("*");
+
+    if (error) {
+      throw error;
+    }
+
+    SOURCE_CHANNELS = {};
+    (data || []).forEach((row) => {
+      SOURCE_CHANNELS[row.channel_id] = {
+        serverName: row.server_name,
+        channelName: row.channel_name,
+      };
+    });
+
+    logger.info(
+      `Loaded ${Object.keys(SOURCE_CHANNELS).length} source channels from Supabase`
+    );
+  } catch (err) {
+    logger.error(
+      `Failed to load source channels from Supabase: ${err?.stack || err}`
+    );
+  }
+}
+
+async function loadDestinationServers() {
+  if (!supabase) {
+    logger.error(
+      "Supabase client not initialized. Cannot load destination servers."
+    );
+    return;
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("discord_destination_servers")
+      .select("*");
+
+    if (error) {
+      throw error;
+    }
+
+    DESTINATION_SERVER_MAP = {};
+    (data || []).forEach((row) => {
+      DESTINATION_SERVER_MAP[row.server_name] = row.webhook_url || "";
+    });
+
+    logger.info(
+      `Loaded ${Object.keys(DESTINATION_SERVER_MAP).length} destination servers from Supabase`
+    );
+  } catch (err) {
+    logger.error(
+      `Failed to load destination servers from Supabase: ${err?.stack || err}`
+    );
+  }
+}
+
+async function rebuildChannelConfigs() {
+  if (!supabase) {
     return;
   }
 
@@ -106,20 +153,95 @@ async function loadChannelConfigs() {
       })
       .filter(Boolean);
 
-    configsLoaded = true;
     logger.info(
-      `Loaded ${CHANNEL_CONFIGS.length} channel configs from Supabase`
+      `Rebuilt ${CHANNEL_CONFIGS.length} channel configs`
     );
   } catch (err) {
     logger.error(
-      `Failed to load channel configs from Supabase: ${err?.stack || err}`
+      `Failed to rebuild channel configs: ${err?.stack || err}`
     );
   }
+}
+
+async function loadChannelConfigs() {
+  if (!supabase) {
+    logger.error(
+      "Supabase client not initialized. Cannot load channel configs."
+    );
+    return;
+  }
+
+  await loadSourceChannels();
+  await loadDestinationServers();
+  await rebuildChannelConfigs();
+
+  configsLoaded = true;
+}
+
+function setupRealtimeSubscriptions() {
+  if (!supabase) {
+    logger.warn("Supabase client not initialized. Cannot setup realtime subscriptions.");
+    return;
+  }
+
+  const channel1 = supabase
+    .channel("discord_source_channels_changes")
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "discord_source_channels",
+      },
+      async (payload) => {
+        logger.info(`Source channel change detected: ${payload.eventType}`);
+        await loadSourceChannels();
+        await rebuildChannelConfigs();
+      }
+    )
+    .subscribe();
+
+  const channel2 = supabase
+    .channel("discord_destination_servers_changes")
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "discord_destination_servers",
+      },
+      async (payload) => {
+        logger.info(`Destination server change detected: ${payload.eventType}`);
+        await loadDestinationServers();
+        await rebuildChannelConfigs();
+      }
+    )
+    .subscribe();
+
+  const channel3 = supabase
+    .channel("discord_channel_configs_changes")
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "discord_channel_configs",
+      },
+      async (payload) => {
+        logger.info(`Channel config change detected: ${payload.eventType}`);
+        await rebuildChannelConfigs();
+      }
+    )
+    .subscribe();
+
+  realtimeSubscriptions = [channel1, channel2, channel3];
+  logger.info("Realtime subscriptions setup complete");
 }
 
 export async function initializeChannelConfigs() {
   if (!configsLoaded) {
     await loadChannelConfigs();
+    setupRealtimeSubscriptions();
   }
 }
 
@@ -139,4 +261,13 @@ export function getSourceChannelInfo(channelId) {
 
 export function getAllChannelIds() {
   return Object.keys(SOURCE_CHANNELS);
+}
+
+export function cleanup() {
+  realtimeSubscriptions.forEach((subscription) => {
+    if (subscription) {
+      subscription.unsubscribe();
+    }
+  });
+  realtimeSubscriptions = [];
 }
